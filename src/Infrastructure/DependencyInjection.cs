@@ -1,58 +1,72 @@
 ﻿using CleanArchitecture.Application.Common.Interfaces;
-using CleanArchitecture.Infrastructure.Files;
+using CleanArchitecture.Domain.Constants;
+using CleanArchitecture.Infrastructure.Data;
+using CleanArchitecture.Infrastructure.Data.Interceptors;
 using CleanArchitecture.Infrastructure.Identity;
-using CleanArchitecture.Infrastructure.Persistence;
-using CleanArchitecture.Infrastructure.Services;
-using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
-namespace CleanArchitecture.Infrastructure
+namespace Microsoft.Extensions.DependencyInjection;
+
+public static class DependencyInjection
 {
-    public static class DependencyInjection
+    public static void AddInfrastructureServices(this IHostApplicationBuilder builder)
     {
-        public static IServiceCollection AddInfrastructure(this IServiceCollection services, IConfiguration configuration)
+        var connectionString = builder.Configuration.GetConnectionString("CleanArchitectureDb");
+        Guard.Against.Null(connectionString, message: "Connection string 'CleanArchitectureDb' not found.");
+
+        builder.Services.AddScoped<ISaveChangesInterceptor, AuditableEntityInterceptor>();
+        builder.Services.AddScoped<ISaveChangesInterceptor, DispatchDomainEventsInterceptor>();
+
+        builder.Services.AddDbContext<ApplicationDbContext>((sp, options) =>
         {
-            if (configuration.GetValue<bool>("UseInMemoryDatabase"))
-            {
-                services.AddDbContext<ApplicationDbContext>(options =>
-                    options.UseInMemoryDatabase("CleanArchitectureDb"));
-            }
-            else
-            {
-                services.AddDbContext<ApplicationDbContext>(options =>
-                    options.UseSqlServer(
-                        configuration.GetConnectionString("DefaultConnection"),
-                        b => b.MigrationsAssembly(typeof(ApplicationDbContext).Assembly.FullName)));
-            }
+            options.AddInterceptors(sp.GetServices<ISaveChangesInterceptor>());
+#if (UsePostgreSQL)
+            options.UseNpgsql(connectionString);
+#elif (UseSqlite)
+            options.UseSqlite(connectionString);
+#else
+            options.UseSqlServer(connectionString);
+#endif
+        });
 
-            services.AddScoped<IApplicationDbContext>(provider => provider.GetService<ApplicationDbContext>());
+#if (UseAspire)
+    #if (UsePostgreSQL)
+        builder.EnrichNpgsqlDbContext<ApplicationDbContext>();
+    #elif (UseSqlServer)
+        builder.EnrichSqlServerDbContext<ApplicationDbContext>();
+    #endif
+#endif
 
-            services.AddScoped<IDomainEventService, DomainEventService>();
+        builder.Services.AddScoped<IApplicationDbContext>(provider => provider.GetRequiredService<ApplicationDbContext>());
 
-            services
-                .AddDefaultIdentity<ApplicationUser>()
-                .AddRoles<IdentityRole>()
-                .AddEntityFrameworkStores<ApplicationDbContext>();
+        builder.Services.AddScoped<ApplicationDbContextInitialiser>();
 
-            services.AddIdentityServer()
-                .AddApiAuthorization<ApplicationUser, ApplicationDbContext>();
+#if (UseApiOnly)
+        builder.Services.AddAuthentication()
+            .AddBearerToken(IdentityConstants.BearerScheme);
 
-            services.AddTransient<IDateTime, DateTimeService>();
-            services.AddTransient<IIdentityService, IdentityService>();
-            services.AddTransient<ICsvFileBuilder, CsvFileBuilder>();
+        builder.Services.AddAuthorizationBuilder();
 
-            services.AddAuthentication()
-                .AddIdentityServerJwt();
+        builder.Services
+            .AddIdentityCore<ApplicationUser>()
+            .AddRoles<IdentityRole>()
+            .AddEntityFrameworkStores<ApplicationDbContext>()
+            .AddApiEndpoints();
+#else
+        builder.Services
+            .AddDefaultIdentity<ApplicationUser>()
+            .AddRoles<IdentityRole>()
+            .AddEntityFrameworkStores<ApplicationDbContext>();
+#endif
 
-            services.AddAuthorization(options =>
-            {
-                options.AddPolicy("CanPurge", policy => policy.RequireRole("Administrator"));
-            });
+        builder.Services.AddSingleton(TimeProvider.System);
+        builder.Services.AddTransient<IIdentityService, IdentityService>();
 
-            return services;
-        }
+        builder.Services.AddAuthorization(options =>
+            options.AddPolicy(Policies.CanPurge, policy => policy.RequireRole(Roles.Administrator)));
     }
 }
